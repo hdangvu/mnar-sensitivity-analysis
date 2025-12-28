@@ -32,11 +32,9 @@ The original group repository is acknowledged and will be referenced for transpa
 
 ---
 
-## Repository Structure (to be finalized)
-```text
-analysis/    # Narrative RMarkdown (paper-style)
-R/           # Modular simulation and modeling code
-data/        # Seed data or data loaders
-figures/     # Generated figures
-results/     # Simulation outputs
-
+## Project Structure
+- `analysis/` : RMarkdown report (main narrative)
+- `R/` : reusable functions (data prep, synthetic generation, MNAR, imputation, simulation, evaluation)
+- `data/` : dataset (Student grading dataset from Kaggle)
+- `figures/` : saved plots used in the report
+- `results/` : simulation outputs (e.g., CSV summaries)

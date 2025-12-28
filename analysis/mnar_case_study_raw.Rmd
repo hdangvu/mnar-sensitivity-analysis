@@ -1,0 +1,1304 @@
+---
+title: "MNAR_Case_Study"
+author: "Ha Dang Vu"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+# Core
+library(tidyverse)   # includes ggplot2, dplyr, tidyr, purrr, readr, etc.
+library(janitor)
+library(skimr)
+
+# Plot helpers / stats
+library(viridis)
+library(patchwork)
+library(reshape2)   
+
+# Correlation / matrix
+library(polycor)
+library(Matrix)
+
+# Synthetic generation
+library(copula)
+
+# Imputation
+library(mice)
+
+# Evaluation / utilities
+library(pROC)
+library(caTools)
+```
+
+## 1. Data Preparation
+```{r}
+# Set seed value ONCE for the rest of the file
+set.seed(7654321)
+```
+
+```{r, echo=FALSE}
+# File path
+KAGGLE_CSV <- "students_performance_dataset.csv"
+
+# Load the raw data
+raw <- read.csv(KAGGLE_CSV, check.names = FALSE, na.strings = c("", "NA", "N/A"))
+
+# Create a new object 'data' with selected and renamed variables
+data <- raw %>%
+  dplyr::rename(
+    id            = Student_ID,
+    age           = Age,
+    internet      = Internet_Access_at_Home,
+    education     = Parent_Education_Level,
+    income        = Family_Income_Level,
+    study         = Study_Hours_per_Week,
+    stress        = `Stress_Level (1-10)`,
+    sleep         = Sleep_Hours_per_Night,
+    participation = Participation_Score,
+    midterm       = Midterm_Score,
+    final         = Final_Score,
+    grade         = Grade,
+  ) %>%
+  dplyr::select(id, age, internet, education, income, study,
+                stress, sleep, participation, midterm, final, grade)
+```
+
+```{r, echo=FALSE}
+# --- Demographic variables vs Grade components ---
+# Select relevant variables
+demo_grade_vars <- c(
+  "Gender",
+  "Age",
+  "Department",
+  "Internet_Access_at_Home",
+  "Parent_Education_Level",
+  "Family_Income_Level",
+  "Final_Score",
+  "Midterm_Score",
+  "Participation_Score",
+  "Grade",
+  "Projects_Score",
+  "Assignments_Avg",
+  "Quizzes_Avg"
+)
+
+demo_grade_df <- raw %>%
+  dplyr::select(all_of(demo_grade_vars)) %>%
+  mutate(
+    # Ordinal mapping for Grade
+    Grade = factor(Grade, levels = c("F","D","C","B","A"), ordered = TRUE),
+    Department = factor(Department),
+    Internet_Access_at_Home = factor(Internet_Access_at_Home, levels = c("No","Yes")),
+    Parent_Education_Level = factor(Parent_Education_Level,
+                                    levels = c("None","High School","Bachelor's","Master's","PhD"),
+                                    ordered = TRUE),
+    Family_Income_Level = factor(Family_Income_Level, levels = c("Low","Medium","High"), ordered = TRUE),
+    Gender = factor(Gender),
+    Age = as.numeric(Age),
+    
+    Final_Score = as.numeric(Final_Score),
+    Midterm_Score = as.numeric(Midterm_Score),
+    Participation_Score = as.numeric(Participation_Score),
+    Projects_Score = as.numeric(Projects_Score),
+    Assignments_Avg = as.numeric(Assignments_Avg),
+    Quizzes_Avg = as.numeric(Quizzes_Avg),
+    
+    Passing = ifelse(Grade %in% c("A","B","C"), 1L, 0L)
+  ) %>%
+  select(-Grade) %>% 
+  drop_na()
+
+# Compute heterogeneous correlation (handles continuous, ordinal, nominal)
+hc <- hetcor(demo_grade_df, std.err = FALSE, )
+cor_mat <- as.matrix(hc$correlations)
+
+# Ensure positive definite for plotting
+cor_mat <- as.matrix(Matrix::nearPD(cor_mat)$mat)
+
+cor_mat[lower.tri(cor_mat, diag = TRUE)] <- NA
+
+# Melt for ggplot
+cor_long <- reshape2::melt(cor_mat, na.rm = TRUE)
+
+# Plot heatmap
+ggplot(cor_long, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.2f", value)), size = 3, color = "black") +
+  
+  scale_fill_viridis(name = "Correlation", limits = c(-1, 1), na.value = "transparent") +
+  
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_blank(),
+    axis.title = element_blank(),
+    panel.grid = element_blank(),
+    legend.position = "right"
+  ) +
+  coord_fixed() +
+  labs(
+    title = "Figure 1: Heterogeneous correlation matrix",
+    subtitle = "Academic, Behavioral, and Sociodemographic variables vs. Passing"
+  )
+```
+
+### Plot distribution for all variables
+```{r}
+# Exclude id and grade
+vars_to_plot <- setdiff(names(data), c("id", "grade"))
+
+# Separate numeric and categorical variables
+num_vars  <- vars_to_plot[sapply(data[vars_to_plot], is.numeric)]
+cat_vars  <- vars_to_plot[!sapply(data[vars_to_plot], is.numeric)]
+
+# --- 1. Plot numeric distributions ---
+plot_numeric <- function(df, var) {
+  ggplot(df, aes(x = .data[[var]])) +
+    geom_histogram(bins = 30, fill = "#0072B2", color = "white", alpha = 0.8) +
+    theme_minimal(base_size = 10) +
+    labs(title = var, x = NULL, y = "Count") +
+    theme(
+      plot.title = element_text(size = 9, face = "bold", hjust = 0.5),
+      axis.text.x = element_text(size = 8),
+      axis.text.y = element_text(size = 8),
+      axis.title.y = element_text(size = 8)
+    )
+}
+
+num_plots <- lapply(num_vars, function(v) plot_numeric(data, v))
+
+# --- 2. Plot categorical distributions ---
+plot_categorical <- function(df, var) {
+  ggplot(df, aes(x = .data[[var]])) +
+    geom_bar(fill = "#E69F00", color = "white", alpha = 0.8) +
+    theme_minimal(base_size = 10) +
+    labs(title = var, x = NULL, y = "Count") +
+    theme(
+      plot.title = element_text(size = 9, face = "bold", hjust = 0.5),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+      axis.text.y = element_text(size = 8),
+      axis.title.y = element_text(size = 8)
+    )
+}
+
+cat_plots <- lapply(cat_vars, function(v) plot_categorical(data, v))
+
+# --- 3. Combine plots in a grid ---
+all_plots <- c(num_plots, cat_plots)
+
+# Combine into grid
+wrap_plots(all_plots, ncol = 4) +
+  plot_annotation(
+    title = "Distributions of All Predictors",
+    theme = theme(
+      plot.title = element_text(size = 13, face = "bold", hjust = 0.5)
+    )
+  )
+```
+
+## 2. Synthetic Generation
+### Logistic Regression Model
+```{r, echo=FALSE}
+# 1) Factor categorical variables (with sensible orders)
+data <- data %>%
+  mutate(
+    grade      = factor(grade, levels = c("F","D","C","B","A"), ordered = TRUE),
+    internet   = factor(internet, levels = c("No","Yes")),
+    education  = factor(education,
+                        levels = c("None","High School","Bachelor's","Master's","PhD"),
+                        ordered = TRUE),
+    income     = factor(income, levels = c("Low","Medium","High"), ordered = TRUE),
+    stress   = factor(stress, levels = 1:10, ordered = TRUE),
+
+    # ensure scores are numeric
+    participation = as.numeric(participation),
+    midterm       = as.numeric(midterm),
+    final         = as.numeric(final),
+    age           = as.numeric(age),
+    study         = as.numeric(study),
+    sleep         = as.numeric(sleep)
+  )
+
+# 2) Binary response: A/B/C = 1, D/F = 0
+data <- data %>%
+  mutate(passing = ifelse(grade %in% c("A","B","C"), 1L, 0L))
+
+# 3) Fit logistic regression with the variables you actually have
+fit_logit <- glm(
+  passing ~ age + internet + education + income +
+            study + sleep + stress +
+            participation + midterm + final,
+  data   = data,
+  family = binomial(link = "logit")
+)
+
+summary(fit_logit)
+```
+
+### Marginal Distribution
+```{r}
+# ---------- helpers ----------
+# robust Uniform fit using trimmed quantiles to get bounds
+fit_uniform <- function(x, trim = 0.01) {
+  x <- x[is.finite(x)]
+  a <- as.numeric(quantile(x, probs = trim))
+  b <- as.numeric(quantile(x, probs = 1 - trim))
+  list(a = a, b = b)
+}
+
+# multinomial levels + empirical probs
+fit_multinom <- function(fct) {
+  fct <- factor(fct)
+  lev <- levels(fct)
+  p   <- as.numeric(prop.table(table(fct)))
+  names(p) <- lev
+  list(levels = lev, prob = p)
+}
+
+# ---------- CONTINUOUS/BOUNDED: assume Uniform ----------
+age_fit    <- fit_uniform(data$age)             # ~18–24
+study_fit  <- fit_uniform(data$study)           # ~5–30
+sleep_fit  <- fit_uniform(data$sleep)           # ~4–9
+part_fit   <- fit_uniform(data$participation)   # ~0–100
+mid_fit    <- fit_uniform(data$midterm)         # ~40–100
+final_fit  <- fit_uniform(data$final)           # ~40–100
+
+# ---------- ORDINAL/DISCRETE ----------
+# stress: discrete 1..10 — choose discrete uniform or empirical
+# (use empirical if want exact match; use rep(0.1, 10) for strict uniform)
+stress_levels <- 1:10
+# empirical:
+stress_probs  <- as.numeric(prop.table(table(factor(data$stress, levels = stress_levels))))
+# or, for strict discrete uniform: stress_probs <- rep(0.1, 10)
+
+stress_fit <- list(levels = stress_levels, prob = stress_probs)
+
+# ---------- CATEGORICAL (multinomial with empirical proportions) ----------
+internet_fit  <- fit_multinom(data$internet)    # Yes/No
+education_fit <- fit_multinom(data$education)   # None, HS, Bachelor's, Master's, PhD
+income_fit    <- fit_multinom(data$income)      # Low, Medium, High
+
+# ---------- quick summary printout ----------
+list(
+  continuous_uniform = list(
+    age = age_fit, study = study_fit, sleep = sleep_fit,
+    participation = part_fit, midterm = mid_fit, final = final_fit
+  ),
+  stress_discrete = stress_fit,
+  categoricals = list(
+    internet = internet_fit,
+    education = education_fit,
+    income = income_fit
+  )
+)
+```
+
+### Gaussian Copula Correlation
+```{r}
+# 1) Prepare types for hetcor
+data_mixed <- data %>%
+  mutate(
+    # continuous/bounded numeric
+    age            = as.numeric(age),
+    study          = as.numeric(study),
+    sleep          = as.numeric(sleep),
+    participation  = as.numeric(participation),
+    midterm        = as.numeric(midterm),
+    final          = as.numeric(final),
+
+    # ordinal
+    stress    = factor(stress, levels = 1:10, ordered = TRUE),
+    education = factor(education,
+                       levels = c("None","High School","Bachelor's","Master's","PhD"),
+                       ordered = TRUE),
+    income    = factor(income, levels = c("Low","Medium","High"), ordered = TRUE),
+
+    # nominal
+    internet  = factor(internet, levels = c("No","Yes"))
+  ) %>%
+  dplyr::select(
+    age, study, sleep, participation, midterm, final,
+    stress, education, income, internet
+  ) %>%
+  tidyr::drop_na()
+
+# 2) Heterogeneous correlation matrix
+hc    <- hetcor(data_mixed, std.err = FALSE)   # auto: Pearson/polyserial/polychoric
+R_mix <- hc$correlations
+
+# 3) Ensure positive definiteness (required by Gaussian copula)
+R_mix_pd <- as.matrix(Matrix::nearPD(R_mix)$mat)
+
+# 4) Construct the Gaussian copula (unstructured correlation)
+cop_all <- normalCopula(P2p(R_mix_pd), dim = ncol(R_mix_pd), dispstr = "un")
+
+# Sanity check
+colnames(R_mix_pd)
+# [1] "age" "study" "sleep" "participation" "midterm" "final" "stress" "education" "income" "internet"
+```
+
+### Sampling helper functions
+```{r}
+# --- 3) Sampling helper functions (aligned with current marginals) ---
+
+# 0) safety clamp for uniforms
+clamp01 <- function(u, eps = 1e-12) pmin(pmax(u, eps), 1 - eps)
+
+# 1) quantile from a stored Uniform fit list: list(a = ..., b = ...)
+q_uniform_fit <- function(u, fit) {
+  qunif(clamp01(u), min = fit$a, max = fit$b)
+}
+
+# 2) discrete inverse-CDF from levels + probs (robust, no off-by-one)
+#    u: vector in (0,1); levels: character/numeric vector; probs: same-length, sum=1
+r_from_u <- function(u, levels, probs) {
+  br <- c(0, cumsum(probs))                 # breaks from 0 .. 1
+  idx <- findInterval(clamp01(u), br, rightmost.closed = TRUE)
+  factor(levels[idx], levels = levels)
+}
+
+# ---------- Precomputed marginal info already fitted ----------
+# Continuous (Uniform fits):  age_fit, study_fit, sleep_fit, part_fit, mid_fit, final_fit
+# Ordinal (discrete):        stress_fit  (list(levels = 1:10, prob = ...))
+# Categoricals (multinom):   internet_fit, education_fit, income_fit
+#   each is list(levels = ..., prob = ...)
+
+# For convenience, expose levels/probs with consistent names
+stress_levels <- as.character(stress_fit$levels)
+stress_probs  <- stress_fit$prob
+
+internet_levels  <- internet_fit$levels;  internet_probs  <- internet_fit$prob
+education_levels <- education_fit$levels; education_probs <- education_fit$prob
+income_levels    <- income_fit$levels;    income_probs    <- income_fit$prob
+```
+
+### Synthetic Data Generator
+```{r}
+generate_predictors_all <- function(n) {
+  stopifnot(exists("cop_all"), exists("R_mix_pd"))
+
+  # 1) Dependent uniforms from the mixed-type Gaussian copula
+  U <- rCopula(n, cop_all)                     # n x 10
+  colnames(U) <- colnames(R_mix_pd)            # enforce names/order
+
+  # 2) Invert uniforms to marginals
+  # continuous (Uniform(a,b))
+  age           <- round(q_uniform_fit(U[, "age"], age_fit))
+  age           <- pmin(pmax(age, 18), 24)
+  study         <- q_uniform_fit(U[, "study"],         study_fit)
+  sleep         <- q_uniform_fit(U[, "sleep"],         sleep_fit)
+  participation <- q_uniform_fit(U[, "participation"], part_fit)
+  midterm       <- q_uniform_fit(U[, "midterm"],       mid_fit)
+  final         <- q_uniform_fit(U[, "final"],         final_fit)
+
+  # ordinal (discrete) and categoricals (multinomial via thresholds)
+  stress    <- r_from_u(U[, "stress"],    as.character(stress_fit$levels),  stress_fit$prob)
+  education <- r_from_u(U[, "education"], education_fit$levels,             education_fit$prob)
+  income    <- r_from_u(U[, "income"],    income_fit$levels,                income_fit$prob)
+  internet  <- r_from_u(U[, "internet"],  internet_fit$levels,              internet_fit$prob)
+
+  # 3) Assemble tibble with correct types/levels
+  tibble::tibble(
+    age  = as.numeric(age),
+    study = as.numeric(study),
+    sleep = as.numeric(sleep),
+    participation = as.numeric(participation),
+    midterm = as.numeric(midterm),
+    final   = as.numeric(final),
+
+    stress = factor(stress, levels = as.character(stress_fit$levels), ordered = TRUE),
+    education = factor(education, levels = education_fit$levels, ordered = TRUE),
+    income    = factor(income,    levels = income_fit$levels,    ordered = TRUE),
+    internet  = factor(internet,  levels = internet_fit$levels)
+  )
+}
+```
+
+### Fit Logistic Regression Model
+```{r}
+# Align columns & types in `newdata` to match the training schema for the model predictors
+align_to_model_schema <- function(newdata, model, train_df) {
+  terms_obj <- terms(model)
+  pred_vars <- attr(terms_obj, "term.labels")  
+
+  # Make sure they exist in training data
+  missing_in_train <- setdiff(pred_vars, names(train_df))
+  if (length(missing_in_train) > 0) {
+    stop("These predictors are in the model but not in `train_df`: ",
+         paste(missing_in_train, collapse = ", "))
+  }
+
+  # Ensure all predictors are present in newdata
+  missing_in_new <- setdiff(pred_vars, names(newdata))
+  if (length(missing_in_new) > 0) {
+    stop("These predictors are required by the model but missing in `newdata`: ",
+         paste(missing_in_new, collapse = ", "))
+  }
+
+  out <- newdata
+
+  # Coerce classes/levels to match training data (so predict.glm() sees identical schema)
+  for (nm in pred_vars) {
+    tr_col <- train_df[[nm]]
+    if (is.factor(tr_col)) {
+      out[[nm]] <- factor(out[[nm]],
+                          levels  = levels(tr_col),
+                          ordered = is.ordered(tr_col))
+    } else if (is.numeric(tr_col)) {
+      out[[nm]] <- as.numeric(out[[nm]])
+    } else if (is.logical(tr_col)) {
+      out[[nm]] <- as.logical(out[[nm]])
+    } else {
+      # default: leave as-is
+      out[[nm]] <- out[[nm]]
+    }
+  }
+
+  out
+}
+
+# with current schema:
+# passing ~ age + internet + education + income + study + sleep + stress + participation + midterm + final
+attach_passing <- function(Xsyn, model = fit_logit, train_df = data) {
+  # Keep only the training columns to align types
+  train_schema <- train_df %>% dplyr::select(-id, -grade, -passing)
+
+  X_aligned <- align_to_model_schema(Xsyn, model = model, train_df = train_schema)
+
+  # Predict Pr(passing = 1) and simulate Bernoulli outcomes
+  p <- predict(model, newdata = X_aligned, type = "response")
+
+  # guardrail: clamp p in (0,1)
+  p <- pmin(pmax(p, .Machine$double.eps), 1 - .Machine$double.eps)
+
+  X_aligned$passing <- rbinom(n = nrow(X_aligned), size = 1, prob = p)
+  X_aligned
+}
+```
+
+```{r}
+# Generate one fully dependent synthetic dataset
+set.seed(123)
+n <- 5000
+synthetic_X <- generate_predictors_all(n)
+synthetic   <- attach_passing(synthetic_X)
+
+str(synthetic)
+mean(synthetic$passing)
+
+# Hist overlays for numeric vars
+plot_numeric_overlay <- function(v) {
+  bind_rows(
+    data      %>% transmute(value = .data[[v]], src = "real"),
+    synthetic %>% transmute(value = .data[[v]], src = "synthetic")
+  ) %>%
+    ggplot(aes(value, fill = src)) +
+    geom_histogram(position = "identity", alpha = 0.45, bins = 30) +
+    theme_minimal(base_size = 11) +
+    labs(title = paste("Real vs Synthetic:", v), x = v, y = "Count")
+}
+
+# Bar overlays for categorical/ordinal vars (aligned levels)
+plot_categorical_overlay <- function(v) {
+  r <- data[[v]]; s <- synthetic[[v]]
+  if (is.factor(r)) s <- factor(s, levels = levels(r), ordered = is.ordered(r))
+  df <- bind_rows(
+    tibble(var = r, src = "real"),
+    tibble(var = s, src = "synthetic")
+  )
+  ggplot(df, aes(x = var, fill = src)) +
+    geom_bar(position = "fill") +
+    scale_y_continuous(labels = scales::percent_format()) +
+    theme_minimal(base_size = 11) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(title = paste("Proportion Overlay:", v), x = v, y = "Proportion")
+}
+
+fig2 <- (
+  plot_numeric_overlay("final") +
+  plot_numeric_overlay("participation") +
+  plot_numeric_overlay("study") +
+  plot_categorical_overlay("stress")
+) +
+  plot_layout(ncol = 2) +
+  plot_annotation(
+    title = "Figure 2: Original vs Synthetic Data Distribution",
+    theme = theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+  )
+
+print(fig2)
+```
+
+## 3. MNAR Mechanisms
+```{r}
+iterations <- 500
+n <- 5000
+
+sim_bank_complete <- vector(mode = "list", length = iterations)
+
+cat("Generating 500 complete synthetic datasets...\n")
+
+for (i in seq_len(iterations)) {
+  Xi <- generate_predictors_all(n)
+  Xi_y <- attach_passing(Xi, model = fit_logit, train_df = data)
+  
+  # Xi_y contains original set of predictors Xi + the target variable y
+  sim_bank_complete[[i]] <- Xi_y
+  
+  if (i %% 50 == 0) {
+    cat("Generated dataset", i, "of", iterations, "\n")
+  }
+}
+
+cat("Finished generating all datasets.\n")
+```
+
+```{r warning=FALSE}
+data_for_sim <- data %>%
+  dplyr::select(-id, -grade)
+
+base_model_formula <- as.formula(
+  passing ~ age + internet + education + income + study + sleep + stress + participation + midterm + final
+)
+
+props_to_test <- c(0.25, 0.40, 0.55, 0.70)
+
+scenarios_to_test <- c("final", "participation", "study")
+
+multivariate_scenarios_list <- list(
+  
+  list(name = "academic_disengagement", 
+       mechanism = "final", 
+       pattern = c("final", "participation", "midterm"), 
+       type = "RIGHT"),
+       
+  list(name = "student_burnout",
+       mechanism = "stress", 
+       pattern = c("stress", "sleep", "study"), 
+       type = "RIGHT")
+)
+
+# Compute variables to numeric to work with mice::ampute function
+ampute_numeric_frame <- function(df) {
+  df %>%
+    mutate(
+      # converting the ordered factor (stress) into numbers since the ampute function only works with numerical data
+      stress = as.numeric(stress),             
+      # dropping non-numeric predictors from the amputation canvas
+      .keep = "unused"
+    ) %>%
+    dplyr::select(age, study, sleep, participation, midterm, final, stress)
+}
+
+
+# Impose MNAR on a specified target variable
+# MNAR via weighted-sum score that depends on the *target’s own value* (classic MNAR).
+mnar_ampute_one <- function(df, target, prop = 0.10, type = c("LEFT", "RIGHT", "TAIL", "MID")) {
+  # Validate inputs
+  type <- match.arg(type)
+  stopifnot(target %in% scenarios_to_test)
+  
+  numDF <- ampute_numeric_frame(df)
+
+  # pattern: make just the target variable missing (0 = missing, 1 = observed)
+  patterns <- matrix(1, nrow = 1, ncol = ncol(numDF), dimnames = list(NULL, names(numDF)))
+  patterns[1, target] <- 0
+
+  # weights: MNAR depends on the variable that is made missing (non-zero on target)
+  w <- rep(0, ncol(numDF)); names(w) <- names(numDF); w[target] <- 1
+  W <- matrix(w, nrow = 1)  # 1 pattern → 1 row
+
+  amp <- ampute(
+    data     = numDF,
+    prop     = prop,
+    patterns = patterns,
+    mech     = "MNAR",
+    weights  = W,
+    type     = type
+  )
+  
+  out <- df
+  out[[target]] <- amp$amp[[target]]
+
+  # Re-cast stress to an ordered factor if target == "stress"
+  if (target == "stress") {
+    out$stress <- factor(round(out$stress), levels = 1:10, ordered = TRUE)
+  }
+  
+  out
+}
+
+
+mnar_ampute_multi <- function(df, target_pattern, mech_variable, prop = 0.10, type = c("LEFT", "RIGHT", "TAIL", "MID")) {
+  # Validate inputs
+  type <- match.arg(type)
+  stopifnot(mech_variable %in% c("final", "stress"))
+  
+  numDF <- .ampute_numeric_frame(df) 
+
+  # The missingness is driven only by the mech_variable
+  w <- rep(0, ncol(numDF)); names(w) <- names(numDF)
+  w[mech_variable] <- 1 
+  W <- matrix(w, nrow = 1) 
+
+  # Multiple values go missing due to mech_variable value
+  patterns <- matrix(1, nrow = 1, ncol = ncol(numDF), dimnames = list(NULL, names(numDF)))
+  patterns[1, target_pattern] <- 0 
+
+  amp <- ampute(
+    data     = numDF,
+    prop     = prop,
+    patterns = patterns,
+    mech     = "MNAR",
+    weights  = W,
+    type     = type
+  )
+  
+  out <- df
+  # Loop and copy back all amputed columns
+  for (col in target_pattern) {
+    if (col %in% names(out)) {
+      out[[col]] <- amp$amp[[col]]
+    }
+  }
+  
+  # Re-cast stress if it was one of the targets
+  if ("stress" %in% target_pattern) {
+    out$stress <- factor(round(out$stress), levels = 1:10, ordered = TRUE)
+  }
+  out
+}
+```
+
+## 4. Imputation Methods
+```{r}
+# Imputes numeric values by mean of the whole column
+impute_mean <- function(df) impute_numeric_factor(df, mean)
+
+# Imputes factors by mode value of the whole column
+impute_mean_mode <- function(df) {
+  df %>%
+    mutate(
+      across(where(is.numeric),
+             ~ ifelse(is.na(.x), mean(.x, na.rm = TRUE), .x)),
+      across(where(is.factor) | where(is.ordered),
+             ~ { if (!anyNA(.x)) .x else { m <- mode_vec(.x); y <- .x; y[is.na(y)] <- m; y } })
+    )
+}
+
+# PMM via mice (m = 1). 
+impute_pmm <- function(df) {
+  meth <- make.method(df)
+  pred <- make.predictorMatrix(df)
+  
+  # Exclude the target variable from being imputed or used as predictor for imputation
+  if ("passing" %in% names(df)) meth["passing"] <- ""
+  if ("passing" %in% colnames(pred)) pred[, "passing"] <- 0
+  
+  imp <- mice(df, m = 1, maxit = 5, method = meth, predictorMatrix = pred, printFlag = FALSE)
+  
+  complete(imp)
+}
+
+
+impute_rf <- function(df) {
+  meth <- make.method(df)
+  pred <- make.predictorMatrix(df)
+  
+  # Exclude the target variable from being imputed or used as predictor for imputation
+  if ("passing" %in% names(df)) meth["passing"] <- ""
+  if ("passing" %in% colnames(pred)) pred[, "passing"] <- 0
+  
+  # Set imputation method to random forest for all variables
+  meth[meth != ""] <- "rf"
+
+  imp <- mice(df, m = 1, maxit = 5, method = meth, predictorMatrix = pred, printFlag = FALSE)
+  
+  complete(imp)
+}
+
+apply_delta_adjustment <- function(df_imputed, df_mnar, target_vars, direction = c("ADD", "SUBTRACT")) {
+  df_out <- df_imputed
+  direction <- match.arg(direction)
+  
+  for (var in target_vars) {
+    na_mask = is.na(df_mnar[[var]])
+    
+    if (sum(na_mask) == 0) next
+    
+    # Delta magnitude will be 1 SD of the observed training data
+    # Use non-missing data to estimate the scale
+    if (is.numeric(df_imputed[[var]])) {
+      vals <- df_imputed[[var]]
+      delta <- sd(vals, na.rm = TRUE) * 1.0
+      
+      if (direction == "ADD") {
+        df_out[[var]][na_mask] <- df_out[[var]][na_mask] + delta
+      } else {
+        df_out[[var]][na_mask] <- df_out[[var]][na_mask] - delta
+      }
+    } else if (is.factor(df_imputed[[var]]) && is.ordered(df_imputed[[var]])) {
+      vals_int <- as.integer(df_imputed[[var]])
+      delta <- sd(vals_int, na.rm = TRUE) * 1.0
+      
+      vals_shifted <- vals_int
+      
+      if (direction == "ADD") {
+        vals_shifted[na_mask] <- vals_shifted[na_mask] + delta
+      } else {
+        vals_shifted[na_mask] <- vals_shifted[na_mask] - delta
+      }
+      
+      num_levels <- length(levels(df_imputed[[var]]))
+      vals_shifted <- round(vals_shifted)
+      vals_shifted <- pmin(pmax(vals_shifted, 1), num_levels)
+      
+      # Restore Factor labels
+      df_out[[var]] <- factor(vals_shifted, 
+                              levels = 1:num_levels, 
+                              labels = levels(df_imputed[[var]]), 
+                              ordered = TRUE)
+    }
+  }
+  
+  return(df_out)
+}
+```
+
+## 5. Model and Simulation
+```{r}
+# Align factor levels to the original "data" schema
+align_to_schema <- function(df_to_fix, schema_df = data_for_sim) {
+  for (name in names(df_to_fix)) {
+    if (name %in% names(schema_df)) {
+      tr_col <- schema_df[[name]]
+      if (is.factor(tr_col)) {
+        df_to_fix[[name]] <- factor(df_to_fix[[name]],
+                                    levels = levels(tr_col),
+                                    ordered = is.ordered(tr_col))
+      }
+    }
+  }
+  df_to_fix
+}
+
+# Each scenario will be executed 500 times and tested on 4 levels of missingness
+total_runs <-(length(scenarios_to_test) + length(multivariate_scenarios_list)) * iterations * length(props_to_test)
+results_list <- vector(mode = "list", length = total_runs)
+
+idx <- 1
+
+# Mark start
+start <- Sys.time()
+
+for (prop in props_to_test) {
+  for (i in seq_len(iterations)) {
+    df_complete = sim_bank_complete[[i]]
+    
+    # Train/ test split - stratify split based on 'passing'
+    split <- sample.split(df_complete$passing, SplitRatio = 0.8)
+    
+    df_train <- align_to_schema(subset(df_complete, split == TRUE), data_for_sim)
+    df_test <- align_to_schema(subset(df_complete, split == FALSE), data_for_sim)
+    y_test <- df_test$passing
+    
+    # Model 1: baseline
+    model_baseline <- glm(base_model_formula, data = df_train, family = binomial(link = "logit"))
+    pred_baseline <- predict(model_baseline, newdata = df_test, type = "response")
+    auc_baseline <- as.numeric(roc(y_test, pred_baseline, quiet = TRUE)$auc)
+
+    pred_class_baseline <- ifelse(pred_baseline > 0.5, 1, 0)
+    acc_baseline <- mean(pred_class_baseline == y_test)
+    misc_baseline <- 1.0 - acc_baseline
+    
+    
+    # Univariate scenarios
+    for (scenario in scenarios_to_test) {
+      mnar_type <- switch(scenario,
+                           "final" = "RIGHT",
+                           "participation" = "LEFT",
+                           "study" = "LEFT")
+      
+      df_train_mnar <- mnar_ampute_one(df_train,
+                                       target = scenario,
+                                       prop = prop,
+                                       type = mnar_type)
+       
+      # Model 2: PMM imputation only
+      df_train_imp_pmm <- impute_pmm(df_train_mnar)
+      df_train_imp_pmm <- align_to_schema(df_train_imp_pmm, data_for_sim)
+      
+      model_pmm <- glm(base_model_formula, data = df_train_imp_pmm, family = binomial(link = "logit"))
+      pred_pmm <- predict(model_pmm, newdata = df_test, type = "response")
+      auc_pmm <- as.numeric(roc(y_test, pred_pmm, quiet = TRUE)$auc)
+      
+      pred_class_pmm <- ifelse(pred_pmm > 0.5, 1, 0)
+      acc_pmm <- mean(pred_class_pmm == y_test)
+      misc_pmm <- 1.0 - acc_pmm
+  
+      
+      # Update MNAR dataset with flags and base model formula for Models 3
+      flag_name <- paste(scenario, "_is_missing", sep = "")
+      df_train_mnar[[flag_name]] <- ifelse(is.na(df_train_mnar[[scenario]]), 1, 0)
+      
+      df_test_with_flag <- df_test
+      df_test_with_flag[[flag_name]] <- 0
+      
+      base_model_formula_string = paste(deparse(base_model_formula), collapse = "")
+      flag_model_formula <- as.formula(paste(base_model_formula_string, "+", flag_name))
+      
+      
+      # Model 3: PMM imputation + binary missing flag
+      df_train_pmm_flag <- impute_pmm(df_train_mnar)
+      df_train_pmm_flag <- align_to_schema(df_train_pmm_flag, data_for_sim)
+      
+      model_pmm_flag <- glm(flag_model_formula, data = df_train_pmm_flag, family = binomial(link = "logit"))
+      pred_pmm_flag <- predict(model_pmm_flag, newdata = df_test_with_flag, type = "response")
+      auc_pmm_flag <- as.numeric(roc(y_test, pred_pmm_flag, quiet = TRUE)$auc)
+      
+      pred_class_pmm_flag <- ifelse(pred_pmm_flag > 0.5, 1, 0)
+      acc_pmm_flag <- mean(pred_class_pmm_flag == y_test)
+      misc_pmm_flag <- 1.0 - acc_pmm_flag
+
+      
+      # Model 4: PMM + Delta Adjustment (Correct direction)_dir_correct
+      delta_dir_correct <- ifelse(mnar_type == "RIGHT", "ADD", "SUBTRACT")
+      
+      df_train_delta_dir_correct <- apply_delta_adjustment(
+        df_imputed = df_train_imp_pmm,
+        df_mnar = df_train_mnar,
+        target_vars = c(scenario),
+        direction = delta_dir_correct
+      )
+      
+      model_delta_dir_correct <- glm(base_model_formula, data = df_train_delta_dir_correct, family = binomial(link = "logit"))
+      pred_delta_dir_correct <- predict(model_delta_dir_correct, newdata = df_test, type = "response")
+      auc_delta_dir_correct <- as.numeric(roc(y_test, pred_delta_dir_correct, quiet = TRUE)$auc)
+      
+      pred_class_delta_dir_correct <- ifelse(pred_delta_dir_correct > 0.5, 1, 0)
+      acc_delta_dir_correct <- mean(pred_class_delta_dir_correct == y_test)
+      misc_delta_dir_correct <- 1.0 - acc_delta_dir_correct
+      
+      
+      # Model 5: PMM + Delta Adjustment (Wrong direction)
+      delta_dir_wrong <- ifelse(mnar_type == "RIGHT", "SUBTRACT", "ADD")
+      
+      df_train_delta_dir_wrong <- apply_delta_adjustment(
+        df_imputed = df_train_imp_pmm,
+        df_mnar = df_train_mnar,
+        target_vars = c(scenario),
+        direction = delta_dir_wrong
+      )
+      
+      model_delta_dir_wrong <- glm(base_model_formula, data = df_train_delta_dir_wrong, family = binomial(link = "logit"))
+      pred_delta_dir_wrong <- predict(model_delta_dir_wrong, newdata = df_test, type = "response")
+      auc_delta_dir_wrong <- as.numeric(roc(y_test, pred_delta_dir_wrong, quiet = TRUE)$auc)
+      
+      pred_class_delta_dir_wrong <- ifelse(pred_delta_dir_wrong > 0.5, 1, 0)
+      acc_delta_dir_wrong <- mean(pred_class_delta_dir_wrong == y_test)
+      misc_delta_dir_wrong <- 1.0 - acc_delta_dir_wrong
+      
+
+      # Persist results
+      results_list[[idx]] <- data.frame(
+        iteration = i,
+        missing_aggressiveness = prop,
+        scenario = scenario,
+        
+        auc_baseline = auc_baseline,
+        acc_baseline = acc_baseline,
+        misc_baseline = misc_baseline,
+        
+        auc_pmm = auc_pmm,
+        acc_pmm = acc_pmm,
+        misc_pmm = misc_pmm,
+        
+        auc_pmm_flag = auc_pmm_flag,
+        acc_pmm_flag = acc_pmm_flag,
+        misc_pmm_flag = misc_pmm_flag,
+        
+        auc_delta_dir_correct = auc_delta_dir_correct,
+        acc_delta_dir_correct = acc_delta_dir_correct,
+        misc_delta_dir_correct = misc_delta_dir_correct,
+        
+        auc_delta_dir_wrong = auc_delta_dir_wrong,
+        acc_delta_dir_wrong = acc_delta_dir_wrong,
+        misc_delta_dir_wrong = misc_delta_dir_wrong)
+      
+      idx <- idx + 1
+    }
+    
+    # Multivariate scenarios
+    for (scenario in multivariate_scenarios_list) {
+      scenario_name <- scenario$name
+
+      df_train_mnar <- mnar_ampute_multi(
+        df = df_train,
+        target_pattern = scenario$pattern,
+        mech_variable = scenario$mechanism,
+        prop = prop,
+        type = scenario$type
+      )
+      
+      
+      # Model 2: PMM imputation only
+      df_train_imp_pmm <- impute_pmm(df_train_mnar)
+      df_train_imp_pmm <- align_to_schema(df_train_imp_pmm, data_for_sim)
+
+      model_pmm <- glm(base_model_formula, data = df_train_imp_pmm, family = binomial(link = "logit"))
+      pred_pmm <- predict(model_pmm, newdata = df_test, type = "response")
+      auc_pmm <- as.numeric(roc(y_test, pred_pmm, quiet = TRUE)$auc)
+
+      pred_class_pmm <- ifelse(pred_pmm > 0.5, 1, 0)
+      acc_pmm <- mean(pred_class_pmm == y_test)
+      misc_pmm <- 1.0 - acc_pmm
+
+      
+      # Update dataset with flags and base model formula for Model 3
+      flag_name <- paste(scenario$mechanism, "_is_missing", sep = "")
+      df_train_mnar[[flag_name]] <- ifelse(is.na(df_train_mnar[[scenario$mechanism]]), 1, 0)
+
+      df_test_with_flag <- df_test
+      df_test_with_flag[[flag_name]] <- 0
+
+      base_model_formula_string <- paste(deparse(base_model_formula), collapse = "")
+      flag_model_formula <- as.formula(paste(base_model_formula_string, "+", flag_name))
+
+      
+      # Model 3: PMM imputation + binary missing flag
+      df_train_pmm_flag <- impute_pmm(df_train_mnar)
+      df_train_pmm_flag <- align_to_schema(df_train_pmm_flag, data_for_sim)
+
+      model_pmm_flag <- glm(flag_model_formula, data = df_train_pmm_flag, family = binomial(link = "logit"))
+      pred_pmm_flag <- predict(model_pmm_flag, newdata = df_test_with_flag, type = "response")
+      auc_pmm_flag <- as.numeric(roc(y_test, pred_pmm_flag, quiet = TRUE)$auc)
+
+      pred_class_pmm_flag <- ifelse(pred_pmm_flag > 0.5, 1, 0)
+      acc_pmm_flag <- mean(pred_class_pmm_flag == y_test)
+      misc_pmm_flag <- 1.0 - acc_pmm_flag
+      
+      
+      # Model 4: PMM + Delta adjustment (Correct direction)
+      delta_dir_correct <- ifelse(scenario$type == "RIGHT", "ADD", "SUBTRACT")
+
+      df_train_delta_dir_correct <- apply_delta_adjustment(
+        df_imputed = df_train_imp_pmm,
+        df_mnar = df_train_mnar,
+        target_vars = scenario$pattern,
+        direction = delta_dir_correct
+      )
+      
+      model_delta_dir_correct <- glm(base_model_formula, data = df_train_delta_dir_correct, family = binomial(link = "logit"))
+      pred_delta_dir_correct <- predict(model_delta_dir_correct, newdata = df_test, type = "response")
+      auc_delta_dir_correct <- as.numeric(roc(y_test, pred_delta_dir_correct, quiet = TRUE)$auc)
+      
+      pred_class_delta_dir_correct <- ifelse(pred_delta_dir_correct > 0.5, 1, 0)
+      acc_delta_dir_correct <- mean(pred_class_delta_dir_correct == y_test)
+      misc_delta_dir_correct <- 1.0 - acc_delta_dir_correct
+      
+      
+      # Model 5: PMM + Delta adjustment (Wrong direction)
+      delta_dir_wrong <- ifelse(scenario$type == "RIGHT", "SUBTRACT", "ADD")
+
+      df_train_delta_dir_wrong <- apply_delta_adjustment(
+        df_imputed = df_train_imp_pmm,
+        df_mnar = df_train_mnar,
+        target_vars = scenario$pattern,
+        direction = delta_dir_wrong
+      )
+      
+      model_delta_dir_wrong <- glm(base_model_formula, data = df_train_delta_dir_wrong, family = binomial(link = "logit"))
+      pred_delta_dir_wrong <- predict(model_delta_dir_wrong, newdata = df_test, type = "response")
+      auc_delta_dir_wrong <- as.numeric(roc(y_test, pred_delta_dir_wrong, quiet = TRUE)$auc)
+      
+      pred_class_delta_dir_wrong <- ifelse(pred_delta_dir_wrong > 0.5, 1, 0)
+      acc_delta_dir_wrong <- mean(pred_class_delta_dir_wrong == y_test)
+      misc_delta_dir_wrong <- 1.0 - acc_delta_dir_wrong
+      
+    
+      # Persist results in the same result list
+      results_list[[idx]] <- data.frame(
+        iteration = i,
+        missing_aggressiveness = prop,
+        scenario = scenario_name,
+  
+        auc_baseline = auc_baseline,
+        acc_baseline = acc_baseline,
+        misc_baseline = misc_baseline,
+  
+        auc_pmm = auc_pmm,
+        acc_pmm = acc_pmm,
+        misc_pmm = misc_pmm,
+  
+        auc_pmm_flag = auc_pmm_flag,
+        acc_pmm_flag = acc_pmm_flag,
+        misc_pmm_flag = misc_pmm_flag,
+        
+        auc_delta_dir_correct = auc_delta_dir_correct,
+        acc_delta_dir_correct = acc_delta_dir_correct,
+        misc_delta_dir_correct = misc_delta_dir_correct,
+        
+        auc_delta_dir_wrong = auc_delta_dir_wrong,
+        acc_delta_dir_wrong = acc_delta_dir_wrong,
+        misc_delta_dir_wrong = misc_delta_dir_wrong)
+
+      idx <- idx + 1
+    }
+    
+    if (i %% 50 == 0) {
+      cat(paste("Completed iteration:", i, "for prop:", prop, "\n"))
+    }
+  }
+}
+
+# Mark end
+end <- Sys.time()
+
+print(end-start)
+
+```
+
+## 6. Evaluation Metrics
+```{r paged.print=FALSE}
+all_results <- bind_rows(results_list)
+
+results_summary <- all_results %>%
+  group_by(missing_aggressiveness, scenario) %>%
+  summarize(
+    across(starts_with("auc_"), mean),
+    across(starts_with("acc_"), mean),
+    across(starts_with("misc_"), mean),
+    .groups = "drop" # Drop grouping
+  )
+
+print(results_summary)
+
+
+results_long <- results_summary %>%
+  pivot_longer(
+    cols = -c(missing_aggressiveness, scenario),
+    names_to = "name",
+    values_to = "value"
+  ) %>%
+  tidyr::separate(
+    name,
+    into = c("metric", "model_type"),
+    sep = "_",
+    extra = "merge"
+  ) %>%
+  mutate(
+    # Capitalize metrics for plotting
+    metric = factor(metric, levels = c("auc", "acc", "misc"), 
+                    labels = c("AUC", "Accuracy", "Misclassification")),
+    # Set the order for the legend
+    model_type = factor(model_type, levels = c("baseline", "pmm_flag", "pmm", "delta_dir_correct", "delta_dir_wrong"),
+                        labels = c("Baseline", "PMM_Flag", "PMM_Only", "Delta_Dir_Correct", "Delta_Dir_Wrong"))
+  )
+
+
+plot_auc <- results_long %>%
+  filter(metric == "AUC") %>%
+  ggplot(aes(x = missing_aggressiveness, y = value, color = model_type, group = model_type)) +
+  geom_line(aes(linetype = model_type), size = 1.1) +
+  geom_point(size = 2) +
+  # Use facet_wrap to create a 2x3 grid
+  facet_wrap(~ scenario, ncol = 3) + 
+  scale_x_continuous(labels = scales::percent_format()) +
+  scale_y_continuous(labels = scales::number_format(accuracy = 0.001)) +
+  scale_linetype_manual(values = c("Baseline" = "solid", "PMM_Flag" = "solid", "PMM_Only" = "solid", "Delta_Dir_Correct" = "solid", "Delta_Dir_Wrong" = "solid")) +
+  scale_color_manual(values = c("Baseline" = "#003f5c", "PMM_Flag" = "#58508d", "PMM_Only" = "#bc5090", "Delta_Dir_Correct" = "#ff6361", "Delta_Dir_Wrong" = "#ffa600")) +
+  labs(
+    title = "Impact of MNAR on Model Performance: AUC",
+    x = "Percent of Data Missing",
+    y = "Mean Area Under the Curve (AUC)",
+    color = "Model Type", linetype = "Model Type"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom", strip.text = element_text(face = "bold"))
+
+
+# 2. Plot for Accuracy
+plot_acc <- results_long %>%
+  filter(metric == "Accuracy") %>%
+  ggplot(aes(x = missing_aggressiveness, y = value, color = model_type, group = model_type)) +
+  geom_line(aes(linetype = model_type), size = 1.1) +
+  geom_point(size = 2) +
+  facet_wrap(~ scenario, ncol = 3) + 
+  scale_x_continuous(labels = scales::percent_format()) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  scale_linetype_manual(values = c("Baseline" = "solid", "PMM_Flag" = "solid", "PMM_Only" = "solid", "Delta_Dir_Correct" = "solid", "Delta_Dir_Wrong" = "solid")) +
+  scale_color_manual(values = c("Baseline" = "#003f5c", "PMM_Flag" = "#58508d", "PMM_Only" = "#bc5090", "Delta_Dir_Correct" = "#ff6361", "Delta_Dir_Wrong" = "#ffa600")) +
+  labs(
+    title = "Impact of MNAR on Model Performance: Accuracy",
+    subtitle = "(at 0.5 Threshold)",
+    x = "Percent of Data Missing",
+    y = "Mean Accuracy",
+    color = "Model Type", linetype = "Model Type"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom", strip.text = element_text(face = "bold"))
+
+
+# 3. Plot for Misclassification
+plot_misc <- results_long %>%
+  filter(metric == "Misclassification") %>%
+  ggplot(aes(x = missing_aggressiveness, y = value, color = model_type, group = model_type)) +
+  geom_line(aes(linetype = model_type), size = 1.1) +
+  geom_point(size = 2) +
+  facet_wrap(~ scenario, ncol = 3) + 
+  scale_x_continuous(labels = scales::percent_format()) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  scale_linetype_manual(values = c("Baseline" = "solid", "PMM_Flag" = "solid", "PMM_Only" = "solid", "Delta_Dir_Correct" = "solid", "Delta_Dir_Wrong" = "solid")) +
+  scale_color_manual(values = c("Baseline" = "#003f5c", "PMM_Flag" = "#58508d", "PMM_Only" = "#bc5090", "Delta_Dir_Correct" = "#ff6361", "Delta_Dir_Wrong" = "#ffa600")) +
+  labs(
+    title = "Impact of MNAR on Model Performance: Misclassification",
+    subtitle = "(at 0.5 Threshold)",
+    x = "Percent of Data Missing",
+    y = "Mean Misclassification Rate",
+    color = "Model Type", linetype = "Model Type"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom", strip.text = element_text(face = "bold"))
+
+
+# Now print each plot separately
+print(plot_auc)
+print(plot_acc)
+print(plot_misc)
+```
+
+```{r}
+test_data_final_40pct <- all_results %>%
+  filter(missing_aggressiveness == 0.40, scenario == "final")
+
+# Is PMM Imputation significantly worse than Baseline?
+t_test_1 <- t.test(test_data_final_40pct$auc_baseline, 
+                   test_data_final_40pct$auc_pmm, 
+                   paired = TRUE, 
+                   alternative = "greater")
+print("T-test: Baseline vs PMM_Only (at 40% 'final' MNAR)")
+print(t_test_1)
+
+# Is PMM_Flag significantly better than PMM_Only?
+t_test_2 <- t.test(test_data_final_40pct$auc_pmm_flag, 
+                   test_data_final_40pct$auc_pmm, 
+                   paired = TRUE, 
+                   alternative = "greater")
+print("T-test: PMM_Flag vs PMM_Only (at 40% 'final' MNAR)")
+print(t_test_2)
+```
+
+```{r}
+figure_1_data <- results_long %>%
+  filter(scenario == "academic_disengagement", 
+         metric == "Accuracy",
+         model_type != "PMM_Flag") %>% 
+  mutate(model_type = factor(model_type, 
+                             levels = c("Baseline", "PMM_Only", "Delta_Dir_Correct", "Delta_Dir_Wrong"),
+                             labels = c("Baseline", "PMM Only", "Delta Correct", "Delta Incorrect")))
+
+ggplot(figure_1_data, aes(x = missing_aggressiveness, y = value, color = model_type, group = model_type)) +
+  geom_line(aes(linetype = model_type), size = 1.2) +
+  geom_point(size = 3) +
+  
+  # Colors for the 4 remaining lines
+  scale_color_manual(values = c("Baseline" = "black", 
+                                "PMM Only" = "#d62728",
+                                "Delta Correct" = "#2ca02c",
+                                "Delta Incorrect" = "orange")) +
+  
+  # Linetypes for the 4 remaining lines
+  scale_linetype_manual(values = c("Baseline" = "solid", 
+                                   "PMM Only" = "solid", 
+                                   "Delta Correct" = "solid", 
+                                   "Delta Incorrect" = "solid")) +
+  
+  scale_x_continuous(labels = scales::percent_format()) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  
+  labs(
+    title = "Impact of Imputation Strategy on Model Accuracy",
+    subtitle = "MNAR Scenario: Multivariate Scenario - High Impact",
+    x = "Missingness Intensity",
+    y = "Classification Accuracy",
+    color = "Repair Strategy",
+    linetype = "Repair Strategy"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "right", 
+        panel.grid.minor = element_blank())
+```
+
+```{r}
+# Filter for only PMM results across the three univariate scenarios
+figure_2_data <- results_long %>%
+  filter(metric == "Accuracy",
+         model_type == "PMM_Only",
+         scenario %in% c("final", "participation", "study")) %>%
+  mutate(scenario_label = factor(scenario, 
+                                 levels = c("final", "participation", "study"),
+                                 labels = c("Final Exam (High Corr)", 
+                                            "Participation (Mod. Corr.)", 
+                                            "Study Hours (Low Corr.)")))
+
+ggplot(figure_2_data, aes(x = missing_aggressiveness, y = value, color = scenario_label, group = scenario_label)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 3, aes(shape = scenario_label)) +
+  
+  # Custom Colors
+  scale_color_manual(values = c("Final Exam (High Corr)" = "#1f77b4",     # Blue
+                                "Participation (Mod. Corr.)" = "#ff7f0e",  # Orange
+                                "Study Hours (Low Corr.)" = "#2ca02c")) +  # Green
+  
+  scale_x_continuous(labels = scales::percent_format()) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  
+  labs(
+    title = "Degradation Profiles by Feature Importance",
+    subtitle = "Performance of PMM Only across MNAR Univariate Scenarios",
+    x = "Missingness Intensity",
+    y = "Classification Accuracy",
+    color = "Missing Feature"
+  ) +
+  guides(shape = "none") + # Hide shape legend (color is enough)
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+```{r}
+# Filter for Academic Disengagement at 70% only
+figure_3_data <- results_long %>%
+  filter(scenario == "academic_disengagement",
+         metric == "Accuracy",
+         missing_aggressiveness == 0.70,
+         model_type %in% c("Baseline", "PMM_Only", "Delta_Dir_Correct", "Delta_Dir_Wrong")) %>%
+  mutate(model_type = factor(model_type, 
+                             levels = c("Baseline", "Delta_Dir_Correct", "PMM_Only", "Delta_Dir_Wrong"),
+                             labels = c("Baseline", "Delta Correct", "PMM Only", "Delta Incorrect")))
+
+ggplot(figure_3_data, aes(x = model_type, y = value, fill = model_type)) +
+  geom_col(width = 0.6, alpha = 0.9) +
+  
+  # Add text labels on top of bars
+  geom_text(aes(label = scales::percent(value, accuracy = 0.1)), 
+            vjust = -0.5, size = 5, fontface = "bold") +
+  
+  # Custom Colors
+  scale_fill_manual(values = c("Baseline" = "black", 
+                               "Delta Correct" = "#2ca02c", 
+                               "PMM Only" = "#d62728", 
+                               "Delta Incorrect" = "orange")) +
+  
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0, 0.85)) + # Adjust limits based on your data
+  
+  labs(
+    title = "The Risk of Manual Intervention",
+    subtitle = "Accuracy at 70% Missingness - MNAR Multivariate High Impact Scenario",
+    x = "",
+    y = "Accuracy"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        panel.grid.major.x = element_blank())
+```
