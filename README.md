@@ -68,7 +68,7 @@ To enable controlled experimentation, synthetic datasets were generated using a 
 Outcome labels were generated using a logistic regression model fitted to the original dataset.  
 Distributional alignment between empirical and synthetic data was visually validated, ensuring that observed effects are attributable to missingness mechanisms rather than simulation artifacts.
 
-!(figures/fig2_real_vs_synth.png)
+![Gaussian Copula](figures/fig2_real_vs_synth.png)
 
 ---
 
